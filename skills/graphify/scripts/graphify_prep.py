@@ -38,8 +38,10 @@ YAML_FENCE_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 KEY_VAL_RE = re.compile(r"^([a-zA-Z_][\w_]*)\s*:\s*(.*)$", re.MULTILINE)
 LIST_ITEM_RE = re.compile(r"^\s*-\s*(.+)$", re.MULTILINE)
 
-# The 16 floors of the High-Rise framework. ai-brain-starter installs this
-# framework into every vault, so these names apply to all repo users.
+# ai-brain-starter's DEFAULT 16 floors — a fallback, not the whole world. A vault
+# may run a larger framework (34 floors) and localize the display names, so the
+# authoritative set is discovered from the vault's own Floors/ notes when they
+# exist (see discover_floors) and these are unioned in as a floor.
 # Each journal/note may have a `dominant_floors:` or `floor:` frontmatter tag
 # pointing at one or more of these — the prep step turns each into an
 # `expresses_floor` edge for free, no LLM needed.
@@ -66,6 +68,55 @@ def normalize_label(label: str) -> str:
             label = label[: -len(suf)]
             break
     return label.strip().lower()
+
+
+FLOOR_LINK_RE = re.compile(r"^\[\[([^\]|#]+?)(?:\|[^\]]+)?\]\]$")
+FLOOR_NUMBER_RE = re.compile(r"^floor_number\s*:", re.MULTILINE)
+
+
+def strip_wikilink(value: str) -> str:
+    """Frontmatter floors are usually quoted wikilinks: '"[[Target|Alias]]"'.
+
+    Returns the LINK TARGET, never the display alias, so a localized vault
+    ('[[Acceptance|Aceptacion]]') lands on the same node as an English one.
+    Plain values pass through untouched.
+    """
+    v = value.strip().strip('"').strip("'").strip()
+    m = FLOOR_LINK_RE.match(v)
+    return m.group(1).strip() if m else v
+
+
+def discover_floors(root: Path) -> set[str]:
+    """Floor names this vault actually uses, unioned with the defaults.
+
+    A vault whose framework is bigger or renamed than ai-brain-starter's default
+    16 would otherwise drop every floor it does not share with that list — the
+    edge is skipped silently and `expresses_floor` reads as legitimately zero.
+    Tier notes ("High Floors", "Low Floors") are containers, not floors.
+    """
+    numbered: set[str] = set()
+    unnumbered: set[str] = set()
+    for d in root.rglob("*"):
+        if not d.is_dir() or d.name.strip().lower() != "floors":
+            continue
+        for p in d.glob("*.md"):
+            stem = p.stem.strip()
+            if stem.lower().endswith("floors"):
+                continue
+            try:
+                head = p.read_text(encoding="utf-8", errors="ignore")[:2000]
+            except OSError:
+                continue
+            # A floor declares its storey. The framework's own overview note
+            # ("El Rascacielos" / "The High-Rise") sits in the same folder and
+            # is not a floor — without this it is admitted as one.
+            if FLOOR_NUMBER_RE.search(head):
+                numbered.add(normalize_label(stem))
+            else:
+                unnumbered.add(normalize_label(stem))
+    # A vault that numbers its floors answers exactly; one that does not falls
+    # back to "every note in Floors/ that is not a tier note".
+    return (numbered or unnumbered) | CANONICAL_FLOORS
 
 
 def canonical_id(label: str) -> str:
@@ -216,6 +267,7 @@ def extract_structural(input_dir: Path, exclude_patterns: list[str] = None) -> d
     edge_keys = set()
     files_seen = 0
 
+    known_floors = discover_floors(input_dir)
     for f in sorted(input_dir.rglob("*.md")):
         if "_review_alternate_drafts" in f.parts:
             continue
@@ -249,17 +301,24 @@ def extract_structural(input_dir: Path, exclude_patterns: list[str] = None) -> d
         if isinstance(floors, str):
             floors = [floors]
         for floor in floors:
-            floor_norm = normalize_label(floor)
-            if floor_norm in CANONICAL_FLOORS:
-                cid = canonical_id(floor)
+            # Resolve `[[Target|Alias]]` first: the graph must key on the target,
+            # or the same floor written in two languages becomes two nodes.
+            floor_target = strip_wikilink(str(floor))
+            floor_norm = normalize_label(floor_target)
+            if floor_norm in known_floors:
+                cid = canonical_id(floor_target)
                 if cid not in nodes_by_id:
                     nodes_by_id[cid] = {
                         "id": cid,
-                        "label": floor.strip().title(),
+                        "label": floor_target.strip().title(),
                         "file_type": "document",
                         "source_file": rel,
                         "is_floor": True,
                     }
+                else:
+                    # The wikilink pass may have created this node first, in which
+                    # case it carries no floor marker. Set it either way.
+                    nodes_by_id[cid]["is_floor"] = True
                 key = (file_stem_id, cid, "expresses_floor")
                 if key not in edge_keys:
                     edge_keys.add(key)

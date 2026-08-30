@@ -18,7 +18,8 @@ Usage:
 Frontmatter fields it understands:
     type: journal | meeting | decision | person   (drives edge typing)
     company:      <value>   → works_at edge
-    floor_level:  <int>     → floor_at edge
+    floor:        <wikilink|value> → floor_at edge (the specific floor)
+    floor_level:  <int|word>       → floor_at_level edge (the coarse tier)
     decision_in_force: <id> → governs edge
     creationDate: <date>    → created_on edge
     relationship: investor  → in a CRM/person file, flips mentions→investor_for
@@ -52,7 +53,8 @@ FRONTMATTER_FIELDS = {
     "type": re.compile(r"^type:\s*(.+)$", re.MULTILINE),
     "relationship": re.compile(r"^relationship:\s*(.+)$", re.MULTILINE),
     "company": re.compile(r"^company:\s*(.+)$", re.MULTILINE),
-    "floor_level": re.compile(r"^floor_level:\s*(\d+)$", re.MULTILINE),
+    "floor": re.compile(r"^floor:\s*(.+)$", re.MULTILINE),
+    "floor_level": re.compile(r"^floor_level:\s*(.+)$", re.MULTILINE),
     "decision_in_force": re.compile(r"^decision_in_force:\s*(.+)$", re.MULTILINE),
     "creationDate": re.compile(r"^creationDate:\s*(.+)$", re.MULTILINE),
 }
@@ -63,9 +65,26 @@ class TypedEdge:
     src: str          # source entity (wikilink target or file title)
     dst: str          # destination entity (wikilink target or frontmatter value)
     edge_type: str    # attended | investor_for | works_at | journaled_about |
-                      # floor_at | governs | created_on | mentions
+                      # floor_at | floor_at_level | governs | created_on | mentions
     src_file: str
     confidence: str   # "high" (frontmatter) | "medium" (path-typed) | "low" (mention only)
+
+
+def _strip_wikilink(value: str) -> str:
+    """Frontmatter values are often quoted wikilinks: '"[[Target|Alias]]"' -> 'Target'."""
+    v = value.strip().strip('"').strip("'").strip()
+    m = WIKILINK_RE.fullmatch(v)
+    return m.group(1).strip() if m else v
+
+
+def _floor_level_node(value: str) -> str:
+    """Numeric levels name a storey ('floor_12'); word levels name the tier note
+    the starter ships ('High Floors' / 'Middle Floors' / 'Low Floors')."""
+    v = _strip_wikilink(value)
+    if v.isdigit():
+        return f"floor_{v}"
+    tier = v[:-6].strip() if v.lower().endswith("floors") else v
+    return f"{tier[:1].upper()}{tier[1:].lower()} Floors" if tier else v
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -129,9 +148,22 @@ def _extract_edges(file_path: Path, root: Path) -> list[TypedEdge]:
             src=src, dst=frontmatter["company"], edge_type="works_at",
             src_file=str(rel_path), confidence="high",
         ))
+    # The specific floor lives in `floor:` (usually a wikilink); the coarse tier
+    # in `floor_level:`. Emit both, typed distinctly, so "which floor" and "which
+    # tier" stay separable instead of collapsing into generic wikilink mentions.
+    frontmatter_targets: set[str] = set()
+    if "floor" in frontmatter:
+        floor_target = _strip_wikilink(frontmatter["floor"])
+        if floor_target:
+            frontmatter_targets.add(floor_target)
+            edges.append(TypedEdge(
+                src=src, dst=floor_target, edge_type="floor_at",
+                src_file=str(rel_path), confidence="high",
+            ))
     if "floor_level" in frontmatter:
         edges.append(TypedEdge(
-            src=src, dst=f"floor_{frontmatter['floor_level']}", edge_type="floor_at",
+            src=src, dst=_floor_level_node(frontmatter["floor_level"]),
+            edge_type="floor_at_level",
             src_file=str(rel_path), confidence="high",
         ))
     if "decision_in_force" in frontmatter:
@@ -146,7 +178,9 @@ def _extract_edges(file_path: Path, root: Path) -> list[TypedEdge]:
         ))
 
     # Wikilink-derived edges (typed by file kind)
-    seen_wikilinks: set[str] = set()
+    # Seeded with frontmatter-derived targets: a floor already emitted as a typed
+    # floor_at edge must not come back as a generic journaled_about mention.
+    seen_wikilinks: set[str] = set(frontmatter_targets)
     for match in WIKILINK_RE.finditer(text):
         target = match.group(1).strip()
         if not target or target in seen_wikilinks:
